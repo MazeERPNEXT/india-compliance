@@ -309,7 +309,9 @@ class TestTransaction(IntegrationTestCase):
 
         self.assertRaisesRegex(
             frappe.exceptions.ValidationError,
-            re.compile(r"^(Please enter a valid HSN/SAC code for.*)$"),
+            re.compile(
+                r"^(HSN/SAC must exist and should be 6 or 8 digits long for.*)$"
+            ),
             doc.submit,
         )
 
@@ -324,7 +326,9 @@ class TestTransaction(IntegrationTestCase):
         doc.save()
         self.assertRaisesRegex(
             frappe.exceptions.ValidationError,
-            re.compile(r"^(Please enter a valid HSN/SAC code for.*)$"),
+            re.compile(
+                r"^(HSN/SAC must exist and should be 6 or 8 digits long for.*)$"
+            ),
             doc.submit,
         )
 
@@ -466,6 +470,44 @@ class TestTransaction(IntegrationTestCase):
         doc.insert()
         self.assertDocumentEqual({"taxable_value": 100}, doc.items[0])
 
+    def test_credit_note_without_quantity(self):
+        if self.doctype != "Sales Invoice":
+            return
+
+        doc = create_transaction(
+            **self.transaction_details, is_return=True, do_not_save=True
+        )
+        append_item(doc)
+
+        for item in doc.items:
+            item.qty = 0
+            item.rate = 0
+            item.price_list_rate = 0
+
+        # Adding charges
+        doc.append(
+            "taxes",
+            {
+                "charge_type": "Actual",
+                "account_head": "Freight and Forwarding Charges - _TIRC",
+                "description": "Freight",
+                "tax_amount": 20,
+                "cost_center": "Main - _TIRC",
+            },
+        )
+
+        # Adding taxes
+        _append_taxes(
+            doc, ("CGST", "SGST"), charge_type="On Previous Row Total", row_id=1
+        )
+        doc.insert()
+
+        # Ensure correct taxable_value and gst details
+        for item in doc.items:
+            self.assertDocumentEqual(
+                {"taxable_value": 10, "cgst_amount": 0.9, "sgst_amount": 0.9}, item
+            )
+
     def test_validate_place_of_supply(self):
         doc = create_transaction(**self.transaction_details, do_not_save=True)
         doc.place_of_supply = "96-Others"
@@ -589,7 +631,7 @@ class TestTransaction(IntegrationTestCase):
 
     def test_invalid_charge_type_as_actual(self):
         doc = create_transaction(**self.transaction_details, do_not_save=True)
-        _append_taxes(doc, ["CGST", "SGST"], charge_type="Actual", tax_amount=9)
+        _append_taxes(doc, ["CGST", "SGST"], charge_type="Actual", tax_amount=9, rate=0)
 
         self.assertRaisesRegex(
             frappe.exceptions.ValidationError,
@@ -606,7 +648,15 @@ class TestTransaction(IntegrationTestCase):
             ["CGST", "SGST"],
             charge_type="Actual",
             tax_amount=9,
-            item_wise_tax_detail=json.dumps({"_Test Trading Goods 1": [9, -9]}),
+            item_wise_tax_detail=json.dumps(
+                {
+                    "_Test Trading Goods 1": {
+                        "tax_rate": 9,
+                        "tax_amount": -9,
+                        "net_amount": -100,
+                    }
+                }
+            ),
             dont_recompute_tax=1,
         )
 
@@ -1243,9 +1293,11 @@ class TestItemUpdate(IntegrationTestCase):
 
 class TestPlaceOfSupply(IntegrationTestCase):
     def test_pos_sales_invoice(self):
+        # Sales Invoice with Shipping Address
         doc_args = {
             "doctype": "Sales Invoice",
             "customer": "_Test Registered Composition Customer",
+            "shipping_address_name": "_Test Indian Registered Company-Billing",
         }
 
         settings = ["Accounts Settings", None, "determine_address_tax_category_from"]
@@ -1259,3 +1311,26 @@ class TestPlaceOfSupply(IntegrationTestCase):
         frappe.db.set_value(*settings, "Billing Address")
         doc = create_transaction(**doc_args)
         self.assertEqual(doc.place_of_supply, "29-Karnataka")
+
+        frappe.db.set_value(*settings, "Shipping Address")
+
+        # Sales Invoice with only Billing Address
+        doc_args = {
+            "doctype": "Sales Invoice",
+            "customer": "_Test Registered Composition Customer",
+        }
+
+        settings = ["Accounts Settings", None, "determine_address_tax_category_from"]
+
+        # (from Billing Address)
+        doc = create_transaction(**doc_args)
+        self.assertEqual(doc.place_of_supply, "29-Karnataka")  # Billing Address
+
+        # Sales Invoice for Unregistered Customer
+        doc_args = {
+            "doctype": "Sales Invoice",
+            "customer": "_Test Unregistered Customer",
+        }
+
+        doc = create_transaction(**doc_args)
+        self.assertEqual(doc.place_of_supply, "24-Gujarat")  # Company GSTIN

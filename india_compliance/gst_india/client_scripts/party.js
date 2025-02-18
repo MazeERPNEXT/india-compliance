@@ -71,7 +71,7 @@ function validate_gstin(doctype) {
                 frm.doc.pan = pan;
                 frm.refresh_field("pan");
                 set_party_type(frm);
-                if(doctype != "Address"){
+                if (doctype != "Address") {
                     india_compliance.set_pan_status(frm.get_field("pan"));
                 }
             }
@@ -85,15 +85,7 @@ function validate_pan(doctype) {
             let { pan } = frm.doc;
             if (!pan || pan.length < 10) return;
 
-            if (pan.length > 10) {
-                frappe.throw(__("PAN should be 10 characters long"));
-            }
-
-            pan = pan.trim().toUpperCase();
-
-            if (!PAN_REGEX.test(pan)) {
-                frappe.throw(__("Invalid PAN format"));
-            }
+            pan = india_compliance.validate_pan(pan);
 
             frm.doc.pan = pan;
             frm.refresh_field("pan");

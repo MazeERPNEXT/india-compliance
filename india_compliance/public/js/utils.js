@@ -6,6 +6,7 @@ import {
     TDS_REGEX,
     TCS_REGEX,
     GST_INVOICE_NUMBER_FORMAT,
+    PAN_REGEX,
 } from "./regex_constants";
 
 frappe.provide("india_compliance");
@@ -39,12 +40,32 @@ Object.assign(india_compliance, {
          * @returns {Array} - [month_or_quarter, year]
          */
 
-        const { filing_frequency } = gst_settings;
         const month_number = period.slice(0, 2);
         const year = period.slice(2);
 
-        if (filing_frequency === "Monthly") return [this.MONTH[month_number - 1], year];
-        else return [this.QUARTER[Math.floor(month_number / 3)], year];
+        return [this.MONTH[month_number - 1], year];
+    },
+
+    get_period(month_or_quarter, year) {
+        /**
+         * Returns the period in the format MMYYYY
+         * as accepted by the GST Portal
+         */
+
+        let month;
+
+        if (month_or_quarter.includes("-")) {
+            // Quarterly
+            const last_month = month_or_quarter.split("-")[1];
+            const date = new Date(`${last_month} 1, ${year}`);
+            month = String(date.getMonth() + 1).padStart(2, "0");
+        } else {
+            // Monthly
+            const date = new Date(`${month_or_quarter} 1, ${year}`);
+            month = String(date.getMonth() + 1).padStart(2, "0");
+        }
+
+        return `${month}${year}`;
     },
 
     get_gstin_query(party, party_type = "Company") {
@@ -87,16 +108,16 @@ Object.assign(india_compliance, {
         return in_list(frappe.boot.sales_doctypes, doctype) ? "Customer" : "Supplier";
     },
 
-    async set_gstin_status(field, transaction_date, force_update) {
+    async set_gstin_status(field, transaction_date, docstatus, force_update) {
         const gstin = field.value;
         if (!gstin || gstin.length !== 15) return field.set_description("");
 
-        const { message } = await frappe.call({
+        let { message } = await frappe.call({
             method: "india_compliance.gst_india.doctype.gstin.gstin.get_gstin_status",
-            args: { gstin, transaction_date, force_update },
+            args: { gstin, transaction_date, docstatus, force_update },
         });
 
-        if (!message) return field.set_description("");
+        if (!message) message = { status: "Not Available" };
 
         field.set_description(
             india_compliance.get_gstin_status_desc(
@@ -123,31 +144,36 @@ Object.assign(india_compliance, {
         if (!message) return;
 
         const [pan_status, datetime] = message;
-        const STATUS_COLORS = {
-            Valid: "green",
-            "Not Linked": "red",
-            Invalid: "red",
-        };
 
-        const user_date = frappe.datetime.str_to_user(datetime);
-        const pretty_date = frappe.datetime.prettyDate(datetime);
-        const pan_desc = $(
-            `<div class="d-flex indicator ${STATUS_COLORS[pan_status] || "orange"}">
-                Status:&nbsp;<strong>${pan_status}</strong>
-                <span class="text-right ml-auto">
-                    <span title="${user_date}">
-                        ${datetime ? "updated " + pretty_date : ""}
-                    </span>
-                    <svg class="icon icon-sm refresh-pan" style="cursor: pointer;">
-                        <use href="#icon-refresh"></use>
-                    </svg>
-                </span>
-            </div>`
+        function get_indicator(status) {
+            switch (status) {
+                case "Valid":
+                    return "green";
+                case "Not Linked":
+                    return "red";
+                case "Invalid":
+                    return "red";
+                default:
+                    return "orange";
+            }
+        }
+
+        const pan_desc = this.get_status_description(
+            pan_status,
+            get_indicator(pan_status),
+            datetime,
+            "pan-last-synced"
         );
 
-        pan_desc.find(".refresh-pan").on("click", async function () {
+        const refresh_btn = this.get_status_refresh_button(
+            "refresh-pan",
+            pan_desc.find(".pan-last-synced")
+        );
+
+        refresh_btn.on("click", async function () {
             await india_compliance.set_pan_status(field, true);
         });
+
         return field.set_description(pan_desc);
     },
 
@@ -162,18 +188,26 @@ Object.assign(india_compliance, {
 
     get_gstin_status_desc(status, datetime) {
         if (!status) return;
-        const user_date = frappe.datetime.str_to_user(datetime);
-        const pretty_date = frappe.datetime.prettyDate(datetime);
 
-        const STATUS_COLORS = { Active: "green", Cancelled: "red" };
-        return `<div class="d-flex indicator ${STATUS_COLORS[status] || "orange"}">
-                    Status:&nbsp;<strong>${status}</strong>
-                    <span class="text-right ml-auto gstin-last-updated">
-                        <span title="${user_date}">
-                            ${datetime ? "updated " + pretty_date : ""}
-                        </span>
-                    </span>
-                </div>`;
+        function get_indicator(status) {
+            switch (status) {
+                case "Active":
+                    return "green";
+                case "Cancelled":
+                    return "red";
+                case "Not Available":
+                    return "grey";
+                default:
+                    return "orange";
+            }
+        }
+
+        return this.get_status_description(
+            status,
+            get_indicator(status),
+            datetime,
+            "gstin-last-synced"
+        );
     },
 
     set_gstin_refresh_btn(field, transaction_date) {
@@ -185,20 +219,49 @@ Object.assign(india_compliance, {
         )
             return;
 
-        const refresh_btn = $(`
-            <svg class="icon icon-sm refresh-gstin" style="">
-                <use class="" href="#icon-refresh" style="cursor: pointer"></use>
-            </svg>
-        `).appendTo(field.$wrapper.find(".gstin-last-updated"));
+        const refresh_btn = this.get_status_refresh_button(
+            "refresh-gstin",
+            field.$wrapper.find(".gstin-last-synced")
+        );
 
         refresh_btn.on("click", async function () {
             const force_update = true;
             await india_compliance.set_gstin_status(
                 field,
                 transaction_date,
+                null,
                 force_update
             );
         });
+    },
+
+    get_status_description(status, indicator, datetime, classes) {
+        const user_date = frappe.datetime.str_to_user(datetime);
+        const pretty_date = frappe.datetime.prettyDate(datetime);
+
+        return $(`<div class="d-flex indicator ${indicator}" style="font-size: 12px">
+                    <strong>${status}</strong>
+                    <span class="d-flex justify-content-between align-items-center ${classes}"
+                        title="${user_date}" style="margin-left: auto;gap: 2px">
+                       <span style="text-align: end;"> ${
+                           datetime ? "Synced " + pretty_date : ""
+                       }</span>
+                    </span>
+                </div>`);
+    },
+
+    get_status_refresh_button(classes, append_to = null, style = null) {
+        if (!style) {
+            style = "cursor: pointer;width: 14px;height: 14px;";
+        }
+
+        const refresh_btn = $(frappe.utils.icon("refresh", "sm", classes, style));
+
+        if (append_to) {
+            refresh_btn.appendTo(append_to);
+        }
+
+        return refresh_btn;
     },
 
     set_state_options(frm) {
@@ -223,6 +286,22 @@ Object.assign(india_compliance, {
 
     is_e_invoice_enabled() {
         return india_compliance.is_api_enabled() && gst_settings.enable_e_invoice;
+    },
+
+    validate_pan(pan) {
+        if (!pan) return;
+
+        pan = pan.trim().toUpperCase();
+
+        if (pan.length != 10) {
+            frappe.throw(__("PAN should be 10 characters long"));
+        }
+
+        if (!PAN_REGEX.test(pan)) {
+            frappe.throw(__("Invalid PAN format"));
+        }
+
+        return pan;
     },
 
     validate_gstin(gstin) {
@@ -288,12 +367,14 @@ Object.assign(india_compliance, {
         // returns a list of error messages if invoice number is invalid
         let message_list = [];
         if (invoice_number.length > 16) {
-            message_list.push("GST Invoice Number cannot exceed 16 characters");
+            message_list.push(
+                "Transaction Name must be 16 characters or fewer to meet GST requirements"
+            );
         }
 
         if (!GST_INVOICE_NUMBER_FORMAT.test(invoice_number)) {
             message_list.push(
-                "GST Invoice Number should start with an alphanumeric character and can only contain alphanumeric characters, dash (-) and slash (/)."
+                "Transaction Name should start with an alphanumeric character and can only contain alphanumeric characters, dash (-) and slash (/) to meet GST requirements."
             );
         }
 
@@ -354,12 +435,10 @@ Object.assign(india_compliance, {
             return position === "start"
                 ? `${current_year - 1}-03-01`
                 : `${current_year - 1}-09-30`;
-
         } else if (current_month <= 9) {
             return position === "start"
                 ? `${current_year - 1}-10-01`
                 : `${current_year}-03-31`;
-
         } else {
             return position === "start"
                 ? `${current_year}-04-01`
@@ -414,6 +493,30 @@ Object.assign(india_compliance, {
         });
 
         return alert;
+    },
+
+    is_e_waybill_applicable_for_subcontracting(doc) {
+        if (
+            !(
+                gst_settings.enable_api &&
+                gst_settings.enable_e_waybill &&
+                gst_settings.enable_e_waybill_for_sc
+            )
+        ) {
+            return false;
+        }
+
+        if (doc.doctype != "Stock Entry") return true;
+
+        if (
+            !["Material Transfer", "Material Issue", "Send to Subcontractor"].includes(
+                doc.purpose
+            )
+        ) {
+            return false;
+        }
+
+        return true;
     },
 });
 
